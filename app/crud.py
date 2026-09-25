@@ -571,6 +571,7 @@ def reset(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
         DELETE FROM calibration_waitlist;
+        DELETE FROM calibration_maintenance_blocks;
         DELETE FROM calibration_bookings;
         DELETE FROM trace_edges;
         DELETE FROM certificate_revisions;

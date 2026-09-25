@@ -952,13 +952,24 @@ class CalibrationCancelOut(BaseModel):
     )
 
 
-class SlotBusyBooking(BaseModel):
-    """空档查询窗内与该窗（半开）相交的一条既有占用。"""
+class SlotBusyItem(BaseModel):
+    """空档查询窗内与该窗（半开）相交的一条既有占用（预约或维护窗口）。"""
 
-    booking_id: str
-    instrument_code: str
+    kind: str = Field(..., description="占用类型：booking 预约 | maintenance 维护窗口")
     start_at: datetime
     end_at: datetime
+    booking_id: Optional[str] = Field(
+        None, description="占用为预约时的预约 id（维护窗口为 null）"
+    )
+    instrument_code: Optional[str] = Field(
+        None, description="占用为预约时的仪器编码（维护窗口为 null）"
+    )
+    block_id: Optional[str] = Field(
+        None, description="占用为维护窗口时的窗口 id（预约为 null）"
+    )
+    reason: Optional[str] = Field(
+        None, description="占用为维护窗口时的维护原因（预约为 null）"
+    )
 
 
 class CalibrationSlot(BaseModel):
@@ -1021,10 +1032,50 @@ class CalibrationSlotsOut(BaseModel):
     slot: Optional[CalibrationSlot] = Field(
         None, description="时间窗内最早可用时段；不存在时为 null"
     )
-    busy: List[SlotBusyBooking] = Field(
+    busy: List[SlotBusyItem] = Field(
         default_factory=list,
-        description="与搜索窗（半开）相交的既有预约，按起点升序",
+        description=(
+            "与搜索窗（半开）相交的既有占用（预约与生效中维护窗口），"
+            "按起点升序"
+        ),
     )
     trace_report: dict = Field(
         ..., description="查询起点该仪器的完整溯源校验报告（结构同 /api/reports）"
+    )
+
+
+# ---------- 校准工位维护封锁 ----------
+
+class MaintenanceBlockIn(BaseModel):
+    """维护窗口登记请求：UTC 半开区间 [start, end) + 维护原因。
+
+    登记在同一写事务内与现有预约及生效中维护窗口查重；首尾相接
+    （起点恰等于既有占用终点，或终点恰等于既有占用起点）允许。
+    """
+
+    start: datetime = Field(
+        ..., description="维护窗口起点（UTC，含），如 2026-06-22T08:00:00Z"
+    )
+    end: datetime = Field(
+        ..., description="维护窗口终点（UTC，不含），须严格晚于起点"
+    )
+    reason: str = Field(
+        ..., min_length=1, description="维护原因（登记后随窗口保存）"
+    )
+
+
+class MaintenanceBlockOut(BaseModel):
+    """一条校准工位维护窗口（占用区间为半开 [start_at, end_at)）。"""
+
+    id: str
+    start_at: datetime = Field(..., description="维护窗口起点（UTC，含）")
+    end_at: datetime = Field(..., description="维护窗口终点（UTC，不含）")
+    reason: str = Field(..., description="维护原因")
+    status: str = Field(..., description="active 生效中 | revoked 已撤销")
+    created_at: datetime = Field(..., description="登记时刻（UTC）")
+    revoked_at: Optional[datetime] = Field(
+        None, description="撤销时刻（UTC）；生效中为 null"
+    )
+    revoke_reason: Optional[str] = Field(
+        None, description="撤销原因；生效中为 null"
     )

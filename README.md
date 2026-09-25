@@ -30,6 +30,13 @@ docker compose up -d --build
 | OpenAPI Schema | http://localhost:8000/openapi.json |
 | 健康检查 | http://localhost:8000/health |
 
+必要配置（环境变量，均有默认值，`docker-compose.yml` 已预置）：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `TRACE_DB_PATH` | `/data/traceability.db` | SQLite 数据文件路径（容器内，卷 `trace-data` 持久化） |
+| `SEED_DEMO` | `1` | 首次启动且库为空时写入演示数据；置 `0` 关闭 |
+
 - SQLite 数据文件持久化在 Docker 卷 `trace-data`（容器内 `/data/traceability.db`）。
 - 首次启动且数据库为空时自动写入演示数据（5 个场景，见第六节）。
   不需要演示数据时，将 `docker-compose.yml` 中的 `SEED_DEMO` 改为 `"0"`。
@@ -59,7 +66,7 @@ curl -s -X POST http://localhost:8000/api/submissions/preflight \
 pip install -r requirements.txt
 SEED_DEMO=1 TRACE_DB_PATH=./data/traceability.db \
   uvicorn app.main:app --reload --port 8000
-pytest -q        # 运行测试（144 个用例）
+pytest -q        # 运行测试（163 个用例）
 ```
 
 > 所有时间均按 **UTC** 解释，建议使用 `YYYY-MM-DDTHH:MM:SSZ` 格式。
@@ -116,12 +123,23 @@ calibration_waitlist（校准工位候补；挂在某条已确认预约上，按
     status_reason（进入 failed/expired 的中文原因）
     promoted_booking_id（补位成功生成的新预约 id）
     created_at（登记时刻）、processed_at（进入终态时刻）
+
+calibration_maintenance_blocks（校准工位维护封锁；与预约共用单工位，半开区间占用）
+    id (PK)、start_at、end_at（封锁区间 [start_at, end_at)，UTC，首尾相接不算冲突）
+    reason（维护原因，登记时保存）
+    status（active 生效中 | revoked 已撤销）
+    created_at（登记时刻）、revoked_at（撤销时刻）、revoke_reason（撤销原因）
+    撤销只改状态不删行：起止区间与维护原因保留供追溯
 ```
 
 - 工位占用**不分仪器**：所有预约共用同一张表；冲突按半开区间
   `b.start < end AND b.end > start` 判定，相接但不重叠不冲突。
 - 预约确认时在同一写事务内重查溯源链与占用；查询/确认要求该仪器在
   起点存在唯一且校验通过的溯源链，且 `end_at <= 起点证书 valid_until`。
+- 维护窗口与预约共用唯一工位：登记时在同一写事务内与现有预约及生效中
+  维护窗口查重（半开，重叠 409 并给冲突 ID，首尾相接允许，失败不写入）；
+  空档查询把生效窗口与预约一并视作占用，确认预约 / 批量改期在各自写事务
+  内重查封锁，取消预约的候补补位也避开生效窗口。
 - 候补沿用目标预约登记时的起止时段排队；**登记时不校验**溯源链与占用，
   而在目标预约取消的补位事务内按队列顺序逐条重验；目标预约改期时
   其未补位（waiting）候补标记失效，避免旧时段队列悬空。
@@ -152,6 +170,9 @@ calibration_waitlist（校准工位候补；挂在某条已确认预约上，按
 | **POST** | **`/api/calibration-bookings/{booking_id}/waitlist`** | **登记候补：沿用该预约起止时段，按登记先后排队（预约不存在 404）** |
 | **GET** | **`/api/calibration-waitlist?booking_id=&instrument=&status=`** | **候补状态查询（队列名次、终态原因）** |
 | **DELETE** | **`/api/calibration-bookings/{booking_id}`** | **取消预约：同一写事务内释放占用并按候补队列补位（重复取消 404，不重复补位）** |
+| **POST** | **`/api/calibration-maintenance`** | **登记维护窗口（UTC 半开区间保存原因；同一写事务与预约及维护窗口查重，重叠 409 给冲突 ID，首尾相接允许）** |
+| **GET** | **`/api/calibration-maintenance?include_revoked=`** | **维护窗口列表（默认生效中，可含已撤销）** |
+| **DELETE** | **`/api/calibration-maintenance/{block_id}?reason=`** | **撤销维护窗口（只改状态不删行，重复撤销 404）** |
 | **GET** | **`/api/export/{instrument}?at=`** | **JSON 导出（attachment 下载）** |
 | **POST** | **`/api/assessments/certificate-deactivation`** | **证书停用影响评估（dry-run，不写库）** |
 | **POST** | **`/api/assessments/common-traceability`** | **批次共同溯源核查：多仪器唯一有效链求最近共同证书（只读，不写库）** |
@@ -417,8 +438,9 @@ curl -G "http://localhost:8000/api/calibration-slots" \
 2. 预约必须在该**唯一有效链起点证书到期前结束**（`end <= valid_until`），
    搜索窗右端按证书截止裁剪（`search_window_end`），到期前放不下时
    `reason_code=CERTIFICATE_DEADLINE_TOO_EARLY`；
-3. 用与搜索窗半开相交的既有预约（`busy`，单工位、不分仪器）贪心求
-   **最早**能容纳所需时长的空档；窗内放不下时
+3. 用与搜索窗半开相交的既有预约与**生效中维护窗口**（`busy`，单工位、
+   不分仪器；`kind=booking|maintenance` 区分两类占用）贪心求**最早**
+   能容纳所需时长的空档；窗内放不下时
    `reason_code=NO_FREE_SLOT_IN_WINDOW`（查询窗本身短于时长返回 422）。
 
 ```jsonc
@@ -438,7 +460,9 @@ curl -G "http://localhost:8000/api/calibration-slots" \
     "end": "2026-06-20T01:00:00Z",
     "ends_by_certificate_valid_until": true
   },
-  "busy": [ /* 与搜索窗半开相交的既有预约：booking_id/instrument_code/start_at/end_at */ ],
+  "busy": [ /* 与搜索窗半开相交的既有占用：预约（kind=booking，含
+               booking_id/instrument_code）与生效中维护窗口
+               （kind=maintenance，含 block_id/reason），按起点升序 */ ],
   "trace_report": { /* 查询起点的完整溯源报告，结构同 /api/reports，便于解释原因 */ }
 }
 ```
@@ -450,8 +474,9 @@ curl -G "http://localhost:8000/api/calibration-slots" \
 服务端按 `start + duration_seconds` 计算）。服务端在**同一写事务**
 （`BEGIN IMMEDIATE`）内**重新检查**（不沿用 GET 的旧结果）：仪器存在 →
 预约起点唯一有效链仍成立 → 结束不晚于起点证书 `valid_until` → 单工位
-在该半开区间无占用；任一条件不成立即返回 **409** 并整体回滚（绝不写入），
-全部成立才在同一事务内原子写入 SQLite：
+在该半开区间无其他预约 → 不与任何**生效中维护窗口**重叠；任一条件不
+成立即返回 **409** 并整体回滚（绝不写入），全部成立才在同一事务内
+原子写入 SQLite：
 
 ```bash
 curl -X POST http://localhost:8000/api/calibration-bookings \
@@ -476,6 +501,7 @@ curl -X POST http://localhost:8000/api/calibration-bookings \
 | `TRACEABILITY_CHAIN_UNAVAILABLE` | 预约起点唯一有效链不成立（`detail.reason_code` 细分，附 `trace_report`） |
 | `BOOKING_ENDS_AFTER_CERT_EXPIRY` | 结束晚于起点证书有效期截止（附两者时刻） |
 | `STATION_OCCUPIED` | 单工位该半开区间已有预约（`detail.conflicting_bookings` 给出全部冲突预约） |
+| `MAINTENANCE_WINDOW_OVERLAP` | 该半开区间与生效中维护窗口重叠（`detail.conflicting_block_ids` 给出全部冲突窗口 ID 与明细） |
 
 > 半开语义下，新预约起点恰等于既有预约结束点（如 `10:00:00Z` 紧接
 > `[09:00,10:00)`）不冲突、可以确认；结束时刻**恰等于**证书
@@ -504,8 +530,9 @@ curl "http://localhost:8000/api/calibration-bookings"
    快照），新结束（`start + duration_seconds`，半开）不晚于新起点
    证书 `valid_until`；
 3. 先把本批预约的**旧占用整体排除**，再按半开区间检查新时段**彼此**
-   及**与其他预约**的冲突——因此允许本批预约**交换时段**（如 A、B
-   互换原占用），也允许**首尾相接**（新起点恰等于另一段结束点）。
+   及**与其他预约**、**与生效中维护窗口**的冲突——因此允许本批预约
+   **交换时段**（如 A、B 互换原占用），也允许**首尾相接**（新起点
+   恰等于另一段结束点）。
 
 任一条件不成立即返回 **409**（`detail.booking_id` 指明失败预约）并
 **整体回滚**（整批保持改期前状态，绝不部分更新）；全部通过才在同一
@@ -539,6 +566,7 @@ curl -X POST http://localhost:8000/api/calibration-bookings/reschedule \
 | `TRACEABILITY_CHAIN_UNAVAILABLE` | 新起点唯一有效链不成立（附 `booking_id` 与 `trace_report`） |
 | `BOOKING_ENDS_AFTER_CERT_EXPIRY` | 新结束晚于新起点证书截止（附 `booking_id` 与两者时刻） |
 | `STATION_OCCUPIED` | 新时段与其他预约冲突（`conflicting_bookings`）或本批新时段彼此冲突（`conflicting_batch_bookings`），均附 `booking_id` |
+| `MAINTENANCE_WINDOW_OVERLAP` | 新时段与生效中维护窗口重叠（`conflicting_block_ids` 给出冲突窗口 ID），附 `booking_id` |
 
 > 改期只更新 `start_at / end_at / duration_seconds / certificate_id /
 > certificate_valid_until`；**仪器、备注与创建时间不变**。改期项少于
@@ -590,10 +618,10 @@ curl "http://localhost:8000/api/calibration-waitlist?instrument=INST-W2&status=w
 在**同一写事务**（`BEGIN IMMEDIATE`）内：删除预约行、释放占用，
 然后**依登记先后逐条重验**候补中申请——仪器在时段起点的唯一有效
 溯源链（重查，不沿用任何旧结果）、时段终点不晚于起点证书
-`valid_until`、与**剩余预约**无半开冲突；**跳过不合格申请**（标记
-`failed` 并记录原因），只将**首个合格申请**转为已确认预约（沿用
-原时段与时长，保存起点证书快照与候补备注），排在中签者之后、未及
-评估的候补中条目标记 `expired`：
+`valid_until`、与**剩余预约**及**生效中维护窗口**无半开冲突；
+**跳过不合格申请**（标记 `failed` 并记录原因），只将**首个合格申请**
+转为已确认预约（沿用原时段与时长，保存起点证书快照与候补备注），
+排在中签者之后、未及评估的候补中条目标记 `expired`：
 
 ```bash
 curl -X DELETE http://localhost:8000/api/calibration-bookings/BK-DEMO-20260620-W1
@@ -619,10 +647,55 @@ curl -X DELETE http://localhost:8000/api/calibration-bookings/BK-DEMO-20260620-W
 
 无合格候补时 `promoted=false`、`promotion=null`，时段真正释放，
 `skipped` 逐条给出不合格原因码（`INSTRUMENT_NOT_FOUND` / 溯源链
-细分原因码 / `BOOKING_ENDS_AFTER_CERT_EXPIRY` / `STATION_OCCUPIED`）。
+细分原因码 / `BOOKING_ENDS_AFTER_CERT_EXPIRY` / `STATION_OCCUPIED` /
+`MAINTENANCE_WINDOW_OVERLAP`——候补时段与生效中维护窗口重叠时跳过）。
 预约不存在或已取消返回 **404**（`BOOKING_NOT_FOUND`）——**重复
 取消不会重复补位**；补位在同一 `BEGIN IMMEDIATE` 写事务内串行化，
 并发取消同一预约恰有一个成功。
+
+**⑧ 维护窗口登记 / 列表 / 撤销（POST·GET·DELETE /api/calibration-maintenance）。**
+维护窗口与预约共用**唯一校准工位**，按 UTC **半开区间**
+`[start, end)` 保存维护原因。登记在**同一写事务**
+（`BEGIN IMMEDIATE`）内检查现有预约与生效中维护窗口：
+
+```bash
+# ① 登记维护窗口（与现有预约及维护窗口半开查重）
+curl -X POST http://localhost:8000/api/calibration-maintenance \
+  -H 'Content-Type: application/json' -d '{
+    "start": "2026-06-22T08:00:00Z",
+    "end": "2026-06-22T14:00:00Z",
+    "reason": "工位导轨与环境监控例行维护，期间停止校准"
+  }'
+# 201
+# {"id":"MW-20260925-xxxxxxxxxxxx", "start_at":"2026-06-22T08:00:00Z",
+#  "end_at":"2026-06-22T14:00:00Z", "reason":"...例行维护...",
+#  "status":"active", "created_at":"...", "revoked_at":null, "revoke_reason":null}
+
+# ② 列表（默认仅生效中；include_revoked=true 一并返回已撤销窗口）
+curl "http://localhost:8000/api/calibration-maintenance"
+curl "http://localhost:8000/api/calibration-maintenance?include_revoked=true"
+
+# ③ 撤销（只改状态不删行，起止区间与原因保留供追溯；可带撤销原因）
+curl -X DELETE "http://localhost:8000/api/calibration-maintenance/MW-20260925-xxxxxxxxxxxx?reason=维护提前完成"
+# 200：status=revoked，revoked_at/revoke_reason 已填写
+```
+
+规则：
+
+- **首尾相接允许**：新窗口起点恰等于既有占用终点（或终点恰等于既有
+  占用起点）不冲突；真正重叠（含一方包含另一方）才拒绝。
+- 与任一**现有预约**重叠即 **409**（`MAINTENANCE_WINDOW_OVERLAP`，
+  `detail.conflicting_booking_ids` 给出全部冲突预约 ID）；与任一**生效
+  中维护窗口**重叠同样 409（`detail.conflicting_block_ids` 给出全部冲突
+  窗口 ID）。事务回滚、**失败绝不写入**。
+- 起点不早于终点（`start >= end`）或原因为空 / 纯空白返回 **422**。
+- 生效中窗口与预约一并占用工位：空档查询 `busy` 中以
+  `kind=maintenance` 给出（见 ①）；确认预约与批量改期在各自写事务内
+  重查封锁，重叠返回 409（改期整批回滚）；取消预约的候补补位避开
+  生效窗口，重叠的候补中申请标记 `failed` 并记录
+  `MAINTENANCE_WINDOW_OVERLAP` 跳过原因。
+- 撤销后窗口立即不再占用工位（上述检查与查询均不再避让）；窗口不
+  存在或已撤销返回 **404**（`MAINTENANCE_NOT_FOUND`），不会重复撤销。
 
 ### 5）证书停用影响评估（dry-run 模拟）
 
@@ -1276,6 +1349,31 @@ curl "http://localhost:8000/api/calibration-waitlist?booking_id=BK-DEMO-20260620
 # INST-T1 的候补     -> expired
 ```
 
+维护窗口示例（演示库已预置 `MW-DEMO-20260622-AM`：2026-06-22
+08:00~14:00 例行维护；与 6 月 20 日的预约/候补不重叠）：
+
+```bash
+# 列表：可见生效中的演示维护窗口
+curl "http://localhost:8000/api/calibration-maintenance"
+# -> MW-DEMO-20260622-AM [2026-06-22T08:00:00Z, 2026-06-22T14:00:00Z) active
+
+# 空档查询覆盖维护日：最早空档被维护窗口推后到 14:00（半开相接），
+# busy 中以 kind=maintenance 给出该窗口
+curl -G "http://localhost:8000/api/calibration-slots" \
+  --data-urlencode "instrument=INST-W1" \
+  --data-urlencode "start=2026-06-22T08:00:00Z" \
+  --data-urlencode "end=2026-06-22T18:00:00Z" \
+  --data-urlencode "duration_seconds=3600"
+# slot: 2026-06-22T14:00:00Z ~ 15:00:00Z
+
+# 维护期间确认预约 -> 409 MAINTENANCE_WINDOW_OVERLAP（附冲突窗口 ID）
+curl -X POST http://localhost:8000/api/calibration-bookings \
+  -H 'Content-Type: application/json' -d '{
+    "instrument_code": "INST-W1", "start": "2026-06-22T09:00:00Z",
+    "duration_seconds": 3600}'
+# 409：detail.conflicting_block_ids=["MW-DEMO-20260622-AM"]
+```
+
 ## 七、溯源算法说明
 
 1. 取目标仪器在 `at` 生效（`valid_from <= at <= valid_until`）的证书作为起点；
@@ -1302,26 +1400,27 @@ curl "http://localhost:8000/api/calibration-waitlist?booking_id=BK-DEMO-20260620
 9. 校准工位预约：全实验室单个工位，占用按半开区间 `[start, end)` 计算。
    GET 在查询起点复用步骤 1~5 要求“唯一成链且零 ERROR”，取起点证书
    `valid_until` 作为预约必须结束的截止并裁剪搜索窗，再以与搜索窗
-   半开相交的既有预约（不分仪器）贪心求最早可容纳所需时长的空档。
-   POST 在 `BEGIN IMMEDIATE` 同一写事务内重查仪器、溯源链、证书截止与
-   半开占用，任一不满足即 409 回滚，全部满足才原子写入；因此并发确认
-   同一时段恰有一个成功，不产生重叠预约。批量改期（reschedule）同样在
-   同一写事务内：核对 2～10 条预约存在且 ID 不重复，逐条按新起点重验
-   唯一有效链与证书截止，将本批旧占用整体排除后按半开区间检查新时段
-   彼此及与其他预约的冲突（允许交换时段与首尾相接），任一失败整体
-   回滚，全部通过才更新时段与证书快照（仪器与备注不变）；时段实际
-   变化的预约，其候补中（waiting）候补在同一事务内标记失效（expired），
-   避免旧时段队列悬空。
+   半开相交的既有预约与**生效中维护窗口**（不分仪器）贪心求最早可容纳
+   所需时长的空档。
+   POST 在 `BEGIN IMMEDIATE` 同一写事务内重查仪器、溯源链、证书截止、
+   半开占用与维护封锁，任一不满足即 409 回滚，全部满足才原子写入；因此
+   并发确认同一时段恰有一个成功，不产生重叠预约。批量改期（reschedule）
+   同样在同一写事务内：核对 2～10 条预约存在且 ID 不重复，逐条按新起点
+   重验唯一有效链与证书截止，将本批旧占用整体排除后按半开区间检查新时段
+   彼此及与其他预约、**维护窗口**的冲突（允许交换时段与首尾相接），任一
+   失败整体回滚，全部通过才更新时段与证书快照（仪器与备注不变）；时段
+   实际变化的预约，其候补中（waiting）候补在同一事务内标记失效
+   （expired），避免旧时段队列悬空。
 10. 候补与取消补位：候补登记在同一写事务内核验目标预约与候补仪器存在
     后写入，沿用该预约当前起止时段快照，按登记先后（`seq` 自增）排队；
     登记时不校验溯源链与占用。取消预约在同一 `BEGIN IMMEDIATE` 写事务
     内删除预约行释放占用，依队列顺序逐条重验候补中申请（时段起点唯一
-    有效溯源链、终点不晚于起点证书 `valid_until`、与剩余预约无半开
-    冲突），不合格申请标记 `failed` 跳过，只将首个合格申请转为已确认
-    预约（沿用原时段与时长，保存起点证书快照与候补备注）并标记
-    `promoted`；排在中签者之后、未及评估的候补中条目标记 `expired`。
-    预约不存在或已取消返回 404，重复取消不会重复补位；写事务串行化
-    保证并发取消同一预约恰有一个完成补位。
+    有效溯源链、终点不晚于起点证书 `valid_until`、与剩余预约及**生效中
+    维护窗口**无半开冲突），不合格申请标记 `failed` 跳过，只将首个合格
+    申请转为已确认预约（沿用原时段与时长，保存起点证书快照与候补备注）
+    并标记 `promoted`；排在中签者之后、未及评估的候补中条目标记
+    `expired`。预约不存在或已取消返回 404，重复取消不会重复补位；写事务
+    串行化保证并发取消同一预约恰有一个完成补位。
 11. 测量相容性评估：对每条读数复用步骤 1~5（只读），仅以“唯一成链且
     零 ERROR”的链参与，取起点证书扩展不确定度为 U；链不可用或起点证书
     单位与目标单位不符的读数逐条记录原因、不参与。对可参与读数两两计算
@@ -1335,6 +1434,16 @@ curl "http://localhost:8000/api/calibration-waitlist?booking_id=BK-DEMO-20260620
     才追加 vN+1，同内容重交不增版；任一步失败整体回滚。批量预检在独立
     事务中模拟并回滚，绝不留下版本。版本列表与指定两版字段差异可按证书
     ID 查询，引用不存在的证书或版本号返回 404。
+13. 校准工位维护封锁：维护窗口与预约共用唯一工位，按 UTC 半开区间
+    `[start, end)` 保存维护原因。登记在 `BEGIN IMMEDIATE` 同一写事务内
+    与现有预约及生效中维护窗口查重（半开 `m.start < end AND m.end >
+    start`，首尾相接允许），与预约重叠时 409 给 `conflicting_booking_ids`，
+    与维护窗口重叠时给 `conflicting_block_ids`，失败回滚不写入。撤销只把
+    状态 active→revoked 并记录撤销时刻/原因、不删行（不存在或已撤销
+    404，不重复撤销）。生效中窗口在空档查询中与预约一并视作占用；确认
+    预约、批量改期在各自写事务内重查封锁（改期冲突整体回滚）；取消预约
+    的候补补位重验避开维护窗口，重叠候补标记 `failed` 并记录
+    `MAINTENANCE_WINDOW_OVERLAP` 跳过原因。
 
 ## 八、项目结构
 
@@ -1355,7 +1464,13 @@ app/
                      查询与取消补位（同一写事务内释放占用、按队列顺序逐条
                      重验并只补位首个合格申请，改期使未补位候补失效）与
                      预约持久化/列表
+  maintenance.py     校准工位维护封锁：维护窗口登记（同一写事务内与预约
+                     及维护窗口半开查重，409 给冲突 ID，首尾相接允许，
+                     失败不写入）、列表与撤销（active→revoked，只改状态
+                     不删行）；find_maintenance_clashes 供空档查询、
+                     预约确认/改期与候补补位重查封锁复用
   seed.py            五场景演示数据 + 1 条校准工位演示预约 + 1 条演示候补
+                     + 1 条演示维护窗口
   routers/           instruments / certificates（含修订历史 revisions
                      与两版差异 diff）/ edges /
                      submissions（批量提交 + preflight 预检）/
@@ -1363,7 +1478,8 @@ app/
                      + 测量相容性评估) /
                      calibration（工位空档 GET + 预约确认 POST + 批量改期
                      POST + 预约列表 GET + 候补登记 POST + 候补状态查询 GET
-                     + 取消补位 DELETE）/
+                     + 取消补位 DELETE + 维护窗口登记 POST / 列表 GET /
+                     撤销 DELETE）/
                      export / admin
 tests/test_trace.py          10 个接口级测试
 tests/test_preflight.py      11 个批量提交预检测试
@@ -1375,5 +1491,6 @@ tests/test_calibration.py    28 个校准工位预约测试
 tests/test_reschedule.py     16 个批量改期测试
 tests/test_revisions.py      15 个证书修订历史测试
 tests/test_waitlist.py       20 个候补登记/查询/取消补位测试
+tests/test_maintenance.py    19 个维护窗口登记/列表/撤销与封锁重查测试
 Dockerfile · docker-compose.yml · requirements.txt
 ```

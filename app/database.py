@@ -121,6 +121,27 @@ CREATE INDEX IF NOT EXISTS idx_waitlist_booking
     ON calibration_waitlist(booking_id, status, seq);
 CREATE INDEX IF NOT EXISTS idx_waitlist_instrument
     ON calibration_waitlist(instrument_code);
+
+-- 校准工位维护封锁：与预约共用唯一工位，占用一律按半开区间
+-- [start_at, end_at) 保存维护原因（首尾相接不算冲突）。登记须在同一写事务
+-- （BEGIN IMMEDIATE）内与现有预约及生效中维护窗口查重，有重叠即 409 不写入；
+-- 撤销只改状态（active -> revoked）不删行，便于追溯。空档查询把生效窗口与
+-- 预约一并视作占用；确认预约 / 批量改期在各自写事务内重查封锁；取消预约的
+-- 候补补位同样避开生效窗口。
+-- status: active 生效中 | revoked 已撤销
+CREATE TABLE IF NOT EXISTS calibration_maintenance_blocks (
+    id            TEXT PRIMARY KEY,
+    start_at      TEXT NOT NULL,
+    end_at        TEXT NOT NULL,
+    reason        TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'active',
+    created_at    TEXT NOT NULL,
+    revoked_at    TEXT,
+    revoke_reason TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_maintenance_interval
+    ON calibration_maintenance_blocks(start_at, end_at);
 """
 
 

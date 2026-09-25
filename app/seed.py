@@ -149,3 +149,18 @@ def seed_demo(conn: sqlite3.Connection) -> None:
         note="演示数据：高度尺候补同一时段",
         created_at=DEMO_AT,
     )
+
+    # ---------- 校准工位维护封锁（演示：6 月 22 日周一上午例行维护） ----------
+    # 生效中的维护窗口与预约一并占用工位（半开区间）。选在 2026-06-22
+    # 与上述 2026-06-20 的预约/候补互不重叠：空档查询覆盖该日时会被
+    # 推后，确认预约 / 批量改期 / 候补补位到该时段则 409 / 跳过。
+    from .maintenance import insert_block
+
+    insert_block(
+        conn,
+        block_id="MW-DEMO-20260622-AM",
+        start_at="2026-06-22T08:00:00Z",
+        end_at="2026-06-22T14:00:00Z",
+        reason="演示数据：工位导轨与环境监控例行维护，期间停止校准",
+        created_at=DEMO_AT,
+    )

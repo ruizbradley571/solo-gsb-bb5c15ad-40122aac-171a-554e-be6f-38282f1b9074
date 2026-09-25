@@ -1,12 +1,15 @@
 """校准工位预约路由。
 
-* ``GET  /api/calibration-slots``               只读：单工位最早可用时段；
-* ``POST /api/calibration-bookings``            写事务内重查占用与证书截止后确认（409 冲突）；
+* ``GET  /api/calibration-slots``               只读：单工位最早可用时段（维护窗口与预约一并视作占用）；
+* ``POST /api/calibration-bookings``            写事务内重查占用、维护封锁与证书截止后确认（409 冲突）；
 * ``POST /api/calibration-bookings/reschedule`` 2～10 条已有预约批量改期（同一写事务核验，409 整体回滚）；
 * ``GET  /api/calibration-bookings``            按仪器（可选）查询已确认预约；
 * ``POST /api/calibration-bookings/{booking_id}/waitlist`` 对指定已确认预约登记候补（沿用该预约时段排队）；
 * ``GET  /api/calibration-waitlist``            候补状态查询（按目标预约/仪器/状态筛选）；
-* ``DELETE /api/calibration-bookings/{booking_id}`` 取消预约并在同一写事务内按候补队列补位（重复取消 404）。
+* ``DELETE /api/calibration-bookings/{booking_id}`` 取消预约并在同一写事务内按候补队列补位（重复取消 404）；
+* ``POST /api/calibration-maintenance``         登记维护窗口（同一写事务内与预约及维护窗口查重，409 冲突）；
+* ``GET  /api/calibration-maintenance``         维护窗口列表（默认生效中，include_revoked=true 含已撤销）；
+* ``DELETE /api/calibration-maintenance/{block_id}`` 撤销维护窗口（只改状态不删行，重复撤销 404）。
 """
 from __future__ import annotations
 
@@ -16,7 +19,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlite3 import Connection
 
-from .. import booking, crud
+from .. import booking, crud, maintenance
 from ..database import get_conn_ctx, get_db
 from ..schemas import (
     CalibrationBookingIn,
@@ -26,6 +29,8 @@ from ..schemas import (
     CalibrationSlotsOut,
     CalibrationWaitlistIn,
     CalibrationWaitlistOut,
+    MaintenanceBlockIn,
+    MaintenanceBlockOut,
 )
 
 router = APIRouter(prefix="/api", tags=["calibration-booking"])
@@ -70,7 +75,9 @@ def calibration_slots(
        搜索窗右端据此裁剪；链不可用（无有效证书/起点不唯一/多候选/
        断裂/校验失败）时 ``slot=null`` 并在 ``reason`` 中说明原因，
        完整证据见 ``trace_report``；
-    3. 在裁剪后的搜索窗内按占用段贪心求最早可容纳所需时长的空档。
+    3. 既有预约与**生效中维护窗口**一并视作占用（``busy`` 中
+       ``kind=booking|maintenance`` 区分），在裁剪后的搜索窗内按
+       占用段贪心求最早可容纳所需时长的空档。
     """
     try:
         return booking.find_slots(db, instrument, start, end, duration_seconds)
@@ -93,11 +100,13 @@ def create_calibration_booking(body: CalibrationBookingIn):
     2. 预约起点该仪器的唯一有效溯源链仍成立（重查，不沿用 GET 结果）；
     3. 预约结束（``start + duration_seconds``，半开）不晚于起点证书
        ``valid_until``；
-    4. 单个工位在该半开区间内无其他预约（``b.start < end AND b.end > start``）。
+    4. 单个工位在该半开区间内无其他预约（``b.start < end AND b.end > start``）；
+    5. 该半开区间不与任何**生效中维护窗口**重叠（首尾相接允许）。
 
     任一条件不成立返回 **409**，响应体带机器可读 ``code``、中文 ``message``
-    与结构化 ``detail``（占用冲突时给出全部冲突预约），事务回滚、绝不写入。
-    全部成立则在同一事务内原子写入 SQLite 并返回已确认预约。
+    与结构化 ``detail``（占用冲突时给出全部冲突预约，维护冲突时给出全部
+    冲突窗口 ID），事务回滚、绝不写入。全部成立则在同一事务内原子写入
+    SQLite 并返回已确认预约。
     """
     try:
         with get_conn_ctx() as conn:
@@ -131,8 +140,8 @@ def reschedule_calibration_bookings(body: CalibrationRescheduleIn):
        在新起点的唯一有效溯源链，且新结束（``start + duration_seconds``，
        半开）不晚于起点证书 ``valid_until``；
     3. 先把本批预约的**旧占用整体排除**，再按半开区间检查新时段**彼此**
-       及**与其他预约**的冲突——因此允许本批预约交换时段，首尾相接
-       （新起点恰等于另一段结束点）也不冲突。
+       及**与其他预约**、**与生效中维护窗口**的冲突——因此允许本批预约
+       交换时段，首尾相接（新起点恰等于另一段结束点）也不冲突。
 
     任一条件不成立返回 **409**，响应体 ``detail.booking_id`` 指明失败的
     预约 ID，并带机器可读 ``code``、中文 ``message`` 与结构化 ``detail``，
@@ -262,7 +271,7 @@ def cancel_calibration_booking(booking_id: str):
     1. 删除预约行、释放单工位占用；
     2. 依登记先后（``seq`` 升序）逐条**重验**候补中申请：仪器在时段
        起点的唯一有效溯源链、时段终点不晚于起点证书 ``valid_until``、
-       与剩余预约无半开冲突；
+       与剩余预约及**生效中维护窗口**无半开冲突；
     3. **跳过不合格申请**（标记 ``failed`` 并记录原因），只将**首个
        合格申请**转为已确认预约（沿用原时段与时长，保存起点证书快照
        与候补备注），该条目标记 ``promoted``；
@@ -278,3 +287,91 @@ def cancel_calibration_booking(booking_id: str):
             return booking.cancel_booking(conn, booking_id)
     except booking.BookingConflict as exc:
         raise _conflict_http(exc)
+
+
+# ---------------------------------------------------------------- 维护封锁
+
+
+def _maintenance_http(exc: maintenance.MaintenanceConflict) -> HTTPException:
+    """维护封锁写事务冲突 → HTTP 响应：窗口不存在/已撤销为 404，其余为 409。"""
+    status = (
+        404
+        if exc.code == maintenance.CONFLICT_MAINTENANCE_NOT_FOUND
+        else 409
+    )
+    return HTTPException(
+        status_code=status,
+        detail={"code": exc.code, "message": exc.message, "detail": exc.detail},
+    )
+
+
+@router.post(
+    "/calibration-maintenance",
+    response_model=MaintenanceBlockOut,
+    status_code=201,
+    summary="登记校准工位维护窗口（同一写事务内查重，冲突 409）",
+)
+def register_maintenance_block(body: MaintenanceBlockIn):
+    """登记维护窗口：维护期间工位封锁，按 UTC **半开区间**
+    ``[start, end)`` 保存维护原因。在**同一写事务**
+    （``BEGIN IMMEDIATE``）内检查：
+
+    1. 与**现有预约**无半开重叠（单工位，不分仪器）；
+    2. 与**生效中维护窗口**无半开重叠。
+
+    首尾相接（新窗口起点恰等于既有占用终点，或终点恰等于既有占用起点）
+    允许。任一有重叠即返回 **409**（``MAINTENANCE_WINDOW_OVERLAP``，
+    ``detail.conflicting_booking_ids`` / ``conflicting_block_ids`` 给出
+    冲突 ID 列表），事务回滚、**绝不写入**；无冲突才在同一事务内原子
+    写入并返回已登记窗口（``status=active``）。
+    """
+    try:
+        with get_conn_ctx() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return maintenance.register_block(
+                conn, body.start, body.end, body.reason
+            )
+    except maintenance.MaintenanceConflict as exc:
+        raise _maintenance_http(exc)
+    except crud.ValidationError as exc:
+        raise HTTPException(422, str(exc))
+
+
+@router.get(
+    "/calibration-maintenance",
+    response_model=list[MaintenanceBlockOut],
+    summary="维护窗口列表（默认生效中，可含已撤销）",
+)
+def list_maintenance_blocks(
+    include_revoked: bool = Query(
+        False, description="true 时一并返回已撤销窗口；默认仅生效中"
+    ),
+    db: Connection = Depends(get_db),
+):
+    """维护窗口列表：按起点升序返回；默认只返回生效中（``active``）窗口，
+    ``include_revoked=true`` 时含已撤销（``revoked``）窗口及其撤销时刻
+    与撤销原因。"""
+    return maintenance.list_blocks(db, include_revoked=include_revoked)
+
+
+@router.delete(
+    "/calibration-maintenance/{block_id}",
+    response_model=MaintenanceBlockOut,
+    summary="撤销维护窗口（只改状态不删行，重复撤销 404）",
+)
+def revoke_maintenance_block(
+    block_id: str,
+    reason: str = Query("", description="可选撤销原因（随窗口保存）"),
+):
+    """撤销维护窗口：在**同一写事务**（``BEGIN IMMEDIATE``）内把生效中
+    窗口标记为 ``revoked`` 并记录撤销时刻与原因——**只改状态不删行**，
+    起止区间与维护原因保留供追溯。撤销后该窗口不再占用工位（空档查询、
+    预约确认、批量改期与候补补位均不再避让）。窗口不存在或已撤销返回
+    **404**（``MAINTENANCE_NOT_FOUND``），不会重复撤销。
+    """
+    try:
+        with get_conn_ctx() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            return maintenance.revoke_block(conn, block_id, reason)
+    except maintenance.MaintenanceConflict as exc:
+        raise _maintenance_http(exc)

@@ -153,6 +153,19 @@ def root():
                 "DELETE /api/calibration-bookings/{booking_id}"
                 "（同一写事务释放占用并按候补队列补位，重复取消 404 不重复补位）"
             ),
+            "calibration_maintenance_register": (
+                "POST /api/calibration-maintenance"
+                "（登记维护窗口，UTC 半开区间保存原因；同一写事务与预约及"
+                "维护窗口查重，重叠 409 给冲突 ID，首尾相接允许）"
+            ),
+            "calibration_maintenance_list": (
+                "GET /api/calibration-maintenance"
+                "（维护窗口列表；默认生效中，include_revoked=true 含已撤销）"
+            ),
+            "calibration_maintenance_revoke": (
+                "DELETE /api/calibration-maintenance/{block_id}?reason="
+                "（撤销维护窗口，只改状态不删行，重复撤销 404）"
+            ),
         },
         "demo_query_time": DEMO_AT,
     }
