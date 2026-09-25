@@ -19,6 +19,7 @@ from .routers import (
     edges,
     export,
     instruments,
+    maintenance_windows,
     submissions,
     trace,
 )
@@ -89,6 +90,7 @@ app.include_router(edges.router)
 app.include_router(submissions.router)
 app.include_router(trace.router)
 app.include_router(calibration.router)
+app.include_router(maintenance_windows.router)
 app.include_router(export.router)
 app.include_router(export.admin_router)
 
@@ -151,7 +153,21 @@ def root():
             ),
             "calibration_booking_cancel": (
                 "DELETE /api/calibration-bookings/{booking_id}"
-                "（同一写事务释放占用并按候补队列补位，重复取消 404 不重复补位）"
+                "（同一写事务释放占用并按候补队列补位，重复取消 404 不重复补位；"
+                "补位重查避开生效维护窗口，跳过记录 STATION_UNDER_MAINTENANCE）"
+            ),
+            "calibration_maintenance_register": (
+                "POST /api/calibration-maintenance-windows"
+                "（UTC 半开区间登记工位维护封锁与原因；同一写事务内检查既有预约"
+                "与维护窗口，半开重叠 409 并回冲突 ID，首尾相接允许）"
+            ),
+            "calibration_maintenance_list": (
+                "GET /api/calibration-maintenance-windows?status=&start=&end="
+                "（维护窗口列表；空档查询把维护窗口与预约一并视作占用）"
+            ),
+            "calibration_maintenance_revoke": (
+                "DELETE /api/calibration-maintenance-windows/{window_id}"
+                "（撤销维护封锁，软删除；重复撤销 404）"
             ),
         },
         "demo_query_time": DEMO_AT,

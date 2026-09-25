@@ -19,12 +19,18 @@
   整体回滚，全部通过才更新时段与证书快照（仪器与备注保持不变）。
   时段实际变化的预约，其未补位候补（waiting）在同一事务内标记失效，
   避免旧时段队列悬空。
+* 维护封锁：生效中维护窗口（``station_maintenance_windows``，见
+  ``maintenance`` 模块）与预约一样按半开区间占用单工位。空档查询把
+  维护窗口与预约一并视作占用；确认预约、批量改期在各自写事务内重查
+  活跃维护窗口（改期仅排除本批旧预约、不排除维护窗口），重叠返回 409，
+  批量改期整体回滚。
 * 候补（waitlist）：对指定已确认预约登记候补仪器与备注，候补沿用该
   预约登记时的起止时段，按登记先后（``seq`` 自增）排队。取消预约时
   在同一 ``BEGIN IMMEDIATE`` 写事务内释放占用，依队列顺序逐条重验
-  仪器在时段起点的唯一有效溯源链、证书到期时刻及与剩余预约的半开
-  冲突；跳过不合格申请，只将首个合格申请转为已确认预约并保存证书
-  快照；预约行已删除，重复取消返回 404，不会重复补位。
+  仪器在时段起点的唯一有效溯源链、证书到期时刻及与剩余预约和生效中
+  维护窗口的半开冲突；跳过不合格申请（撞维护封锁记
+  ``STATION_UNDER_MAINTENANCE``），只将首个合格申请转为已确认预约并
+  保存证书快照；预约行已删除，重复取消返回 404，不会重复补位。
 """
 from __future__ import annotations
 
@@ -35,6 +41,7 @@ from typing import Any, Optional
 
 from .crud import ValidationError, get_instrument
 from .engine import unique_chain_gate
+from .maintenance import overlapping_windows as _overlapping_maintenance
 from .utils import fmt, to_utc_naive, utcnow_str
 
 # 链不可用 / 无空档等原因码
@@ -48,6 +55,8 @@ CONFLICT_INSTRUMENT_NOT_FOUND = "INSTRUMENT_NOT_FOUND"
 CONFLICT_CHAIN_UNAVAILABLE = "TRACEABILITY_CHAIN_UNAVAILABLE"
 CONFLICT_ENDS_AFTER_CERT_EXPIRY = "BOOKING_ENDS_AFTER_CERT_EXPIRY"
 CONFLICT_STATION_OCCUPIED = "STATION_OCCUPIED"
+# 半开区间与生效中维护封锁窗口重叠（确认/改期/补位重查共用）
+CONFLICT_STATION_UNDER_MAINTENANCE = "STATION_UNDER_MAINTENANCE"
 
 # 批量改期新增的冲突原因码（其余复用单条确认的四条）
 CONFLICT_DUPLICATE_BOOKING_ID = "DUPLICATE_BOOKING_ID"
@@ -198,6 +207,36 @@ def find_clashes(
     return [_booking_dict(r) for r in rows]
 
 
+def _maintenance_clash_dicts(
+    conn: sqlite3.Connection, start_s: str, end_s: str
+) -> list[dict[str, Any]]:
+    """占用重查：与半开区间 ``[start_s, end_s)`` 重叠的生效中维护窗口。"""
+    rows = _overlapping_maintenance(conn, start_s, end_s)
+    return [
+        {
+            "maintenance_window_id": r["id"],
+            "start_at": r["start_at"],
+            "end_at": r["end_at"],
+            "reason": r["reason"],
+        }
+        for r in rows
+    ]
+
+
+def _raise_if_maintenance(
+    conn: sqlite3.Connection, start_s: str, end_s: str, *, what: str
+) -> None:
+    """半开区间与生效中维护窗口重叠时抛 409（``what`` 描述被封锁对象）。"""
+    windows = _maintenance_clash_dicts(conn, start_s, end_s)
+    if windows:
+        raise BookingConflict(
+            CONFLICT_STATION_UNDER_MAINTENANCE,
+            f"{what} {start_s} ~ {end_s}（半开区间）与单工位上 "
+            f"{len(windows)} 个生效维护窗口重叠，工位维护封锁中",
+            {"conflicting_maintenance_windows": windows},
+        )
+
+
 # ---------------------------------------------------------------- 最早空档
 
 def _earliest_slot(
@@ -270,6 +309,7 @@ def find_slots(
             "search_window_end": hi_s,
             "slot": None,
             "busy": [],
+            "maintenance_windows": [],
             "trace_report": gate["report"],
         }
 
@@ -307,12 +347,17 @@ def find_slots(
             "search_window_end": search_end_s,
             "slot": None,
             "busy": [],
+            "maintenance_windows": [],
             "trace_report": gate["report"],
         }
 
-    # 3) 单工位占用（与半开搜索窗相交的既有预约），求最早空档
+    # 3) 单工位占用（与半开搜索窗相交的既有预约 + 生效中维护窗口），
+    #    两者一并视作占用，求最早空档
     rows = _overlapping_bookings(conn, lo_s, search_end_s)
+    mrows = _overlapping_maintenance(conn, lo_s, search_end_s)
     busy = [(_parse(r["start_at"]), _parse(r["end_at"])) for r in rows]
+    busy += [(_parse(r["start_at"]), _parse(r["end_at"])) for r in mrows]
+    busy.sort(key=lambda iv: (iv[0], iv[1]))
     found = _earliest_slot(busy, start_naive, search_end, duration)
 
     result: dict[str, Any] = {
@@ -335,6 +380,15 @@ def find_slots(
                 "end_at": r["end_at"],
             }
             for r in rows
+        ],
+        "maintenance_windows": [
+            {
+                "maintenance_window_id": r["id"],
+                "start_at": r["start_at"],
+                "end_at": r["end_at"],
+                "reason": r["reason"],
+            }
+            for r in mrows
         ],
         "trace_report": gate["report"],
     }
@@ -429,6 +483,11 @@ def confirm_booking(
             f"{len(clashes)} 条预约占用，时段冲突",
             {"conflicting_bookings": clashes},
         )
+
+    # 4.1) 维护封锁重查：同一写事务内重查活跃维护窗口（半开重叠即 409）
+    _raise_if_maintenance(
+        conn, start_s, end_s, what="预约时段"
+    )
 
     # 5) 全部条件成立：原子写入（与上述重查处于同一写事务）
     return insert_booking(
@@ -637,6 +696,22 @@ def reschedule_bookings(
                     },
                 )
 
+    # 3.1) 维护封锁重查：本批预约旧占用可整体排除，但活跃维护窗口不排除
+    #      （改期不得移入维护时段）；逐条半开查重，任一重叠整体回滚。
+    for t in targets:
+        windows = _maintenance_clash_dicts(conn, t["start_s"], t["end_s"])
+        if windows:
+            raise BookingConflict(
+                CONFLICT_STATION_UNDER_MAINTENANCE,
+                f"预约 {t['booking_id']} 新时段 {t['start_s']} ~ {t['end_s']}"
+                f"（半开区间）与单工位上 {len(windows)} 个生效维护窗口重叠，"
+                "工位维护封锁中",
+                {
+                    "booking_id": t["booking_id"],
+                    "conflicting_maintenance_windows": windows,
+                },
+            )
+
     # 4) 全部通过：逐条更新时段与证书快照（仪器/备注/创建时间不变）
     updated = [
         _update_booking_schedule(
@@ -833,7 +908,7 @@ def _revalidate_for_slot(
     end_s: str,
 ) -> tuple[bool, Optional[str], Optional[str], Optional[str], Optional[str]]:
     """补位重验（取消事务内）：仪器存在、时段起点唯一有效溯源链、
-    证书到期时刻覆盖时段终点、与剩余预约无半开冲突。
+    证书到期时刻覆盖时段终点、与剩余预约及生效维护窗口无半开冲突。
 
     返回 ``(ok, reason_code, reason, certificate_id, certificate_valid_until)``；
     不合格时给出原因码与中文说明，由调用方跳过该申请，绝不抛出中断队列。
@@ -877,6 +952,17 @@ def _revalidate_for_slot(
             cert_id,
             deadline_s,
         )
+    windows = _maintenance_clash_dicts(conn, start_s, end_s)
+    if windows:
+        return (
+            False,
+            CONFLICT_STATION_UNDER_MAINTENANCE,
+            f"候补时段 {start_s} ~ {end_s}（半开区间）与 "
+            f"{len(windows)} 个生效维护窗口重叠，工位维护封锁中，"
+            "候补补位跳过该申请",
+            cert_id,
+            deadline_s,
+        )
     return True, None, None, cert_id, deadline_s
 
 
@@ -889,8 +975,9 @@ def cancel_booking(conn: sqlite3.Connection, booking_id: str) -> dict[str, Any]:
        （``BOOKING_NOT_FOUND``，路由层映射 404）——重复取消不会重复补位；
     2. 删除预约行、释放占用；
     3. 依登记先后（seq 升序）逐条重验候补中条目：仪器在时段起点的
-       唯一有效溯源链、证书到期时刻、与剩余预约的半开冲突；不合格
-       申请标记 ``failed`` 并跳过；
+       唯一有效溯源链、证书到期时刻、与剩余预约及生效中维护窗口的
+       半开冲突；不合格申请标记 ``failed`` 并跳过（撞维护封锁记
+       ``STATION_UNDER_MAINTENANCE``）；
     4. 首个合格申请转为已确认预约（沿用原时段与时长，保存起点证书
        快照与候补备注），该条目标记 ``promoted``；
     5. 排在中签者之后、未及评估的条目（时段已被补位）标记 ``expired``。

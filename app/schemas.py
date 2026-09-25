@@ -181,6 +181,26 @@ class CalibrationWaitlistIn(BaseModel):
     note: str = Field("", description="候补备注（补位成功时随新预约保存）")
 
 
+class MaintenanceWindowIn(BaseModel):
+    """工位维护封锁登记请求：UTC 半开区间 [start, end) + 封锁原因。"""
+
+    start: datetime = Field(
+        ..., description="维护封锁起点（UTC，含），如 2026-06-20T12:00:00Z"
+    )
+    end: datetime = Field(
+        ..., description="维护封锁终点（UTC，不含），须严格晚于起点"
+    )
+    reason: str = Field(..., min_length=1, description="维护/封锁原因（非空）")
+
+    @field_validator("reason")
+    @classmethod
+    def _strip_reason(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("维护原因 reason 不能为空白字符串")
+        return v
+
+
 class CommonTraceIn(BaseModel):
     """批次共同溯源核查请求（只读，不写入数据库）。"""
 
@@ -910,7 +930,8 @@ class WaitlistSkipOut(BaseModel):
         ...,
         description=(
             "不合格原因码：INSTRUMENT_NOT_FOUND | 溯源链细分原因码 | "
-            "BOOKING_ENDS_AFTER_CERT_EXPIRY | STATION_OCCUPIED"
+            "BOOKING_ENDS_AFTER_CERT_EXPIRY | STATION_OCCUPIED | "
+            "STATION_UNDER_MAINTENANCE（补位时段撞维护封锁）"
         ),
     )
     reason: str = Field(..., description="中文原因说明")
@@ -959,6 +980,15 @@ class SlotBusyBooking(BaseModel):
     instrument_code: str
     start_at: datetime
     end_at: datetime
+
+
+class SlotMaintenanceWindow(BaseModel):
+    """空档查询窗内与该窗（半开）相交的一条生效中维护封锁（同样占用工位）。"""
+
+    maintenance_window_id: str
+    start_at: datetime
+    end_at: datetime
+    reason: str = Field(..., description="维护封锁原因")
 
 
 class CalibrationSlot(BaseModel):
@@ -1025,6 +1055,31 @@ class CalibrationSlotsOut(BaseModel):
         default_factory=list,
         description="与搜索窗（半开）相交的既有预约，按起点升序",
     )
+    maintenance_windows: List[SlotMaintenanceWindow] = Field(
+        default_factory=list,
+        description=(
+            "与搜索窗（半开）相交的生效中维护封锁窗口，按起点升序；"
+            "维护窗口与预约一并视作工位占用"
+        ),
+    )
     trace_report: dict = Field(
         ..., description="查询起点该仪器的完整溯源校验报告（结构同 /api/reports）"
+    )
+
+
+# ---------- 校准工位维护封锁输出 ----------
+
+class MaintenanceWindowOut(BaseModel):
+    """一条校准工位维护封锁窗口（半开 [start_at, end_at)，UTC）。"""
+
+    id: str = Field(..., description="维护窗口 id（MW- 前缀）")
+    start_at: datetime = Field(..., description="封锁起点（UTC，含）")
+    end_at: datetime = Field(..., description="封锁终点（UTC，不含）")
+    reason: str = Field(..., description="维护/封锁原因")
+    status: str = Field(
+        ..., description="active 生效中（参与占用重查）| revoked 已撤销（软删除）"
+    )
+    created_at: datetime = Field(..., description="登记时刻（UTC）")
+    revoked_at: Optional[datetime] = Field(
+        None, description="撤销时刻（UTC）；生效中为 null"
     )

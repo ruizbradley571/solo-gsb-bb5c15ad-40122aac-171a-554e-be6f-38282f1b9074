@@ -121,6 +121,28 @@ CREATE INDEX IF NOT EXISTS idx_waitlist_booking
     ON calibration_waitlist(booking_id, status, seq);
 CREATE INDEX IF NOT EXISTS idx_waitlist_instrument
     ON calibration_waitlist(instrument_code);
+
+-- 校准工位维护封锁：全实验室仅有“单个工位”，维护窗口同样按半开区间
+-- [start_at, end_at) 占用工位（首尾相接允许）。登记在同一写事务内与
+-- 既有预约及其他活跃维护窗口一起查重叠；空档查询把维护窗口与预约
+-- 一并视作占用；预约确认、批量改期与取消候补补位均在各自写事务内
+-- 重查活跃维护窗口，重叠即 409 整体回滚。撤销（revoke）为软删除：
+-- 行保留用于追溯，仅把 status 置为 revoked，重查只看 active 窗口。
+-- status: active 生效中 | revoked 已撤销
+CREATE TABLE IF NOT EXISTS station_maintenance_windows (
+    id          TEXT PRIMARY KEY,
+    start_at    TEXT NOT NULL,
+    end_at      TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'active',
+    created_at  TEXT NOT NULL,
+    revoked_at  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_maintenance_interval
+    ON station_maintenance_windows(start_at, end_at);
+CREATE INDEX IF NOT EXISTS idx_maintenance_status
+    ON station_maintenance_windows(status, start_at);
 """
 
 

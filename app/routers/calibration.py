@@ -1,12 +1,14 @@
 """校准工位预约路由。
 
-* ``GET  /api/calibration-slots``               只读：单工位最早可用时段；
-* ``POST /api/calibration-bookings``            写事务内重查占用与证书截止后确认（409 冲突）；
-* ``POST /api/calibration-bookings/reschedule`` 2～10 条已有预约批量改期（同一写事务核验，409 整体回滚）；
+* ``GET  /api/calibration-slots``               只读：单工位最早可用时段（维护窗口与预约一并占用）；
+* ``POST /api/calibration-bookings``            写事务内重查占用、维护封锁与证书截止后确认（409 冲突）；
+* ``POST /api/calibration-bookings/reschedule`` 2～10 条已有预约批量改期（同一写事务核验，含维护封锁，409 整体回滚）；
 * ``GET  /api/calibration-bookings``            按仪器（可选）查询已确认预约；
 * ``POST /api/calibration-bookings/{booking_id}/waitlist`` 对指定已确认预约登记候补（沿用该预约时段排队）；
 * ``GET  /api/calibration-waitlist``            候补状态查询（按目标预约/仪器/状态筛选）；
-* ``DELETE /api/calibration-bookings/{booking_id}`` 取消预约并在同一写事务内按候补队列补位（重复取消 404）。
+* ``DELETE /api/calibration-bookings/{booking_id}`` 取消预约并在同一写事务内按候补队列补位（避开维护窗口；重复取消 404）。
+
+维护封锁窗口的登记/列表/撤销见 ``routers/maintenance_windows.py``。
 """
 from __future__ import annotations
 
@@ -65,12 +67,14 @@ def calibration_slots(
     1. 全实验室仅**单个校准工位**，所有仪器共用一份占用；占用按
        **半开区间** ``[start_at, end_at)`` 计算，相接但不重叠的预约
        （如 ``[09,10)`` 与 ``[10,11)``）互不冲突；
-    2. 在**查询起点**要求该仪器存在**唯一且校验通过**的溯源链，预约
+    2. **生效中的维护封锁窗口与预约一并视作工位占用**（响应分别在
+       ``busy`` 与 ``maintenance_windows`` 中列出），空档计算须同时避开；
+    3. 在**查询起点**要求该仪器存在**唯一且校验通过**的溯源链，预约
        必须在其**起点证书到期前结束**（``end <= valid_until``），
        搜索窗右端据此裁剪；链不可用（无有效证书/起点不唯一/多候选/
        断裂/校验失败）时 ``slot=null`` 并在 ``reason`` 中说明原因，
        完整证据见 ``trace_report``；
-    3. 在裁剪后的搜索窗内按占用段贪心求最早可容纳所需时长的空档。
+    4. 在裁剪后的搜索窗内按占用段贪心求最早可容纳所需时长的空档。
     """
     try:
         return booking.find_slots(db, instrument, start, end, duration_seconds)
@@ -93,7 +97,9 @@ def create_calibration_booking(body: CalibrationBookingIn):
     2. 预约起点该仪器的唯一有效溯源链仍成立（重查，不沿用 GET 结果）；
     3. 预约结束（``start + duration_seconds``，半开）不晚于起点证书
        ``valid_until``；
-    4. 单个工位在该半开区间内无其他预约（``b.start < end AND b.end > start``）。
+    4. 单个工位在该半开区间内无其他预约（``b.start < end AND b.end > start``）；
+    5. 该半开区间不与任何**生效中维护封锁窗口**重叠（首尾相接允许），
+       冲突返回 ``STATION_UNDER_MAINTENANCE`` 并附全部冲突窗口。
 
     任一条件不成立返回 **409**，响应体带机器可读 ``code``、中文 ``message``
     与结构化 ``detail``（占用冲突时给出全部冲突预约），事务回滚、绝不写入。
